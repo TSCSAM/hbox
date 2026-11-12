@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="public/logo/icons/1024x1024.png" alt="Hbox" width="128" height="128" />
+<img src="packages/desktop/build/icon.png" alt="Hbox" width="128" height="128" />
 
 # Hbox
 
