@@ -1,0 +1,21 @@
+{
+  "name": "@hbox/provider",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "lint": "oxlint"
+  },
+  "dependencies": {
+    "@hbox/model-option-map": "workspace:*",
+    "@hbox/shared": "workspace:*",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.2"
+  }
+}

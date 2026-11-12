@@ -1,0 +1,240 @@
+import { useWorkspaceServices } from "@/hooks/useWorkspaceServices.js";
+import { useHboxIntl } from "@/i18n/IntlProvider.js";
+import { useCallback, useRef, useState } from "react";
+import type { IServiceAccessor } from "@hbox/services";
+import type { HboxProvider } from "@hbox/shared";
+import { toast } from "@/components/ui/toast.js";
+import {
+  buildWorkspaceSessionReloadDraftError,
+  shouldDebounceWorkspaceSessionReload,
+} from "@/lib/workspaceSessionReloadPlan.js";
+import { resolveWorkspaceModelConfigSyncScope } from "@/lib/modelConfigSync.js";
+import { prepareWorkspaceWithHboxSessionService } from "@/hooks/useWorkspacePrepare.js";
+import { logger } from "@/logger.js";
+import { useHboxSessionStore } from "@/store/hboxSessionStore.js";
+import { useTabStore } from "@/store/TabStoreProvider.js";
+import { isWorkspaceTab } from "@/store/tabStore.js";
+
+export function useWorkspaceSessionReload({
+  intl,
+  services,
+  workspaceAbsPath,
+  reloadSessionDisabled,
+}: {
+  intl: { formatMessage: (descriptor: { id: string }) => string };
+  services: IServiceAccessor;
+  workspaceAbsPath: string;
+  reloadSessionDisabled: boolean;
+}) {
+  const [reloadSessionPending, setReloadSessionPending] = useState(false);
+  const workspaceIdentity = useTabStore((state) => {
+    if (!state.activeTabId) {
+      return undefined;
+    }
+
+    const activeTab = state.tabs.find((tab) => tab.id === state.activeTabId);
+    if (!activeTab || !isWorkspaceTab(activeTab) || activeTab.workspacePath !== workspaceAbsPath) {
+      return undefined;
+    }
+
+    return activeTab.workspaceIdentity;
+  });
+  const lastReloadSessionTriggeredAtRef = useRef<number | null>(null);
+
+  const handleReloadSession = useCallback(
+    async (options?: { resumeTaskId?: string | null; provider?: HboxProvider | null }) => {
+      if (reloadSessionDisabled || reloadSessionPending) {
+        return;
+      }
+
+      const now = Date.now();
+      if (shouldDebounceWorkspaceSessionReload(lastReloadSessionTriggeredAtRef.current, now)) {
+        // Header 与错误条都可触发 reload，会出现短时间双击/连点并发重建。
+        // 这里在入口做时间窗防抖，避免并发调用 restartWorkspaceProcess 抢占同一 provider-workspace。
+        logger.info(`[App] 忽略重复 workspace session 重建请求 workspace=${workspaceAbsPath}`);
+        return;
+      }
+      lastReloadSessionTriggeredAtRef.current = now;
+      setReloadSessionPending(true);
+
+      const hboxSessionStore = useHboxSessionStore.getState();
+      const latestWorkspaceState = hboxSessionStore.getWorkspaceState(
+        workspaceAbsPath,
+        workspaceIdentity,
+      );
+      const actionScope = resolveWorkspaceModelConfigSyncScope(latestWorkspaceState);
+      const provider: HboxProvider = options?.provider ?? actionScope.provider;
+      const resumeTaskId =
+        options?.resumeTaskId?.trim() || latestWorkspaceState.activeTaskId || undefined;
+      const shouldPrepareWorkspace = !resumeTaskId;
+
+      // Reload session 之前只调用了服务层重建流程，没有同步 workspaceInit 状态到 UI store。
+      // 草稿态下后续准备流程会继续读到旧状态，用户会误判本次重建没有生效。
+      // 这里显式写入 initializing/ready/failed，保证重建状态和会话流程保持一致。
+      hboxSessionStore.setWorkspaceInitState(
+        workspaceAbsPath,
+        "initializing",
+        null,
+        workspaceIdentity,
+      );
+      if (shouldPrepareWorkspace) {
+        hboxSessionStore.setConfigOptionsStatus(workspaceAbsPath, "loading", workspaceIdentity);
+        // 草稿态点击 reload 后若不清空旧错误，输入区会继续显示上一轮失败提示，
+        // 用户会误判本次重建仍失败。这里在新一轮重建开始时先清空草稿错误。
+        hboxSessionStore.setDraftError(workspaceAbsPath, null, workspaceIdentity);
+        hboxSessionStore.setTaskState(workspaceAbsPath, "idle", null, workspaceIdentity);
+      }
+
+      try {
+        await services.hboxTaskService.restartWorkspaceProcess({
+          workspacePath: workspaceAbsPath,
+          ...(workspaceIdentity ? { workspaceIdentity } : {}),
+          provider,
+          resumeTaskId,
+        });
+
+        if (shouldPrepareWorkspace) {
+          const prepareResult = await prepareWorkspaceWithHboxSessionService({
+            workspacePath: workspaceAbsPath,
+            workspaceIdentity,
+            provider,
+            hboxSessionService: services.hboxSessionService,
+          });
+
+          const latestAfterPrepare = hboxSessionStore.getWorkspaceState(
+            workspaceAbsPath,
+            workspaceIdentity,
+          );
+          if (latestAfterPrepare.selectedProvider === provider) {
+            const latestAfterResolve = hboxSessionStore.getWorkspaceState(
+              workspaceAbsPath,
+              workspaceIdentity,
+            );
+            if (latestAfterResolve.selectedProvider === provider) {
+              hboxSessionStore.setConfigOptions(
+                workspaceAbsPath,
+                prepareResult.configOptions ?? [],
+                workspaceIdentity,
+              );
+              hboxSessionStore.setConfigOptionsStatus(
+                workspaceAbsPath,
+                "ready",
+                workspaceIdentity,
+              );
+              hboxSessionStore.setSlashCommands(
+                workspaceAbsPath,
+                prepareResult.slashCommands ?? [],
+                workspaceIdentity,
+              );
+              hboxSessionStore.setDraftError(workspaceAbsPath, null, workspaceIdentity);
+            }
+          }
+        }
+
+        hboxSessionStore.setWorkspaceInitAttempts(workspaceAbsPath, 0, workspaceIdentity);
+        hboxSessionStore.setWorkspaceInitState(workspaceAbsPath, "ready", null, workspaceIdentity);
+
+        logger.info(
+          `[App] workspace session 重建完成 workspace=${workspaceAbsPath} provider=${provider} resumeTaskId=${resumeTaskId ?? "<none>"}`,
+        );
+        toast(intl.formatMessage({ id: "appHeader.reloadSessionSuccess" }));
+      } catch (error) {
+        const reloadDraftError = buildWorkspaceSessionReloadDraftError(error, {
+          workspacePath: workspaceAbsPath,
+          provider,
+        });
+        const message = reloadDraftError.message;
+        logger.warn(
+          `[App] workspace session 重建失败 workspace=${workspaceAbsPath} provider=${provider}`,
+          {
+            resumeTaskId: resumeTaskId ?? null,
+            message,
+          },
+        );
+        hboxSessionStore.setWorkspaceInitState(
+          workspaceAbsPath,
+          "failed",
+          message,
+          workspaceIdentity,
+        );
+        if (shouldPrepareWorkspace) {
+          hboxSessionStore.setConfigOptionsStatus(workspaceAbsPath, "error", workspaceIdentity);
+          // 草稿态下 reload 前会先清空旧错误；如果失败后不回填 draftError，
+          // 聊天区只剩 toast，用户看不到可重试的详细报错。这里统一回填标准化错误到输入区。
+          hboxSessionStore.setDraftError(workspaceAbsPath, reloadDraftError, workspaceIdentity);
+        }
+        toast(intl.formatMessage({ id: "appHeader.reloadSessionFailed" }));
+      } finally {
+        setReloadSessionPending(false);
+      }
+    },
+    [
+      intl,
+      reloadSessionDisabled,
+      reloadSessionPending,
+      services.hboxTaskService,
+      services.hboxSessionService,
+      workspaceAbsPath,
+      workspaceIdentity,
+    ],
+  );
+
+  return {
+    reloadSessionPending,
+    handleReloadSession,
+  };
+}
+
+/** 两个 UI 入口只提交意图；操作合并与生命周期事实由 CLI 管理。 */
+export function useSessionRuntimeRestart(
+  workspacePath: string,
+  sessionId: string | null | undefined,
+  remoteSessionId?: string | null,
+  workspaceIdentity?: string,
+) {
+  const services = useWorkspaceServices(
+    workspacePath,
+    remoteSessionId ?? undefined,
+    workspaceIdentity,
+  );
+  const { intl } = useHboxIntl();
+  const [pendingKey, setPendingKey] = useState<string | null>(null);
+  const key = `${workspaceIdentity || workspacePath}\0${sessionId ?? ""}`;
+  const flight = useRef<{ key: string; promise: Promise<boolean> } | null>(null);
+  const restart = useCallback((): Promise<boolean> => {
+    if (!sessionId) return Promise.resolve(false);
+    if (flight.current?.key === key) return flight.current.promise;
+    setPendingKey(key);
+    const request = services.hboxAgentService
+      .restartSessionRuntime({
+        workspacePath,
+        sessionId,
+        ...(workspaceIdentity ? { workspaceIdentity } : {}),
+      })
+      .then(
+        () => true,
+        (error: unknown) => {
+          logger.warn("[session-lifecycle] 任务重启失败", { sessionId, error });
+          toast(
+            intl.formatMessage({
+              id:
+                error instanceof Error &&
+                error.message.includes("fault.sessionLifecycle.unsupported")
+                  ? "taskList.restartUnsupported"
+                  : "taskList.restartFailed",
+            }),
+          );
+          return false;
+        },
+      )
+      .finally(() => {
+        if (flight.current?.promise === request) {
+          flight.current = null;
+          setPendingKey(null);
+        }
+      });
+    flight.current = { key, promise: request };
+    return request;
+  }, [key, services.hboxAgentService, workspacePath, workspaceIdentity, sessionId, intl]);
+  return { restart, pending: pendingKey === key };
+}

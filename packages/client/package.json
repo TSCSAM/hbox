@@ -1,0 +1,21 @@
+{
+  "name": "@hbox/client",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./globals": "./src/globals.d.ts"
+  },
+  "scripts": {
+    "lint": "oxlint",
+    "lint:fix": "oxlint --fix"
+  },
+  "dependencies": {
+    "@hbox/rpc": "workspace:*",
+    "@hbox/services": "workspace:*",
+    "@hbox/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.2"
+  }
+}
